@@ -16,7 +16,7 @@
 #include "efanna2e/parameters.h"
 #include "efanna2e/util.h"
 #include "index_bipartite.h"
-
+//只用改initial ratio
 namespace po = boost::program_options;
 
 int main(int argc, char **argv) {
@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
                            po::value<std::string>(&projection_index_save_file)->required(),
                            "Path prefix for saving projetion index file components");
         // desc.add_options()("M_bp", po::value<uint32_t>(&M_bp)->default_value(32),
-                        //    "Number of neighbors for base points to build the bipartite graph");
+        //                    "Number of neighbors for base points to build the bipartite graph");
         desc.add_options()("M_sq", po::value<uint32_t>(&M_sq)->default_value(32),
                            "Number of neighbors for sampled query points to build the bipartite graph");
         desc.add_options()("M_pjbp", po::value<uint32_t>(&M_pjbp)->default_value(32),
@@ -127,7 +127,8 @@ int main(int argc, char **argv) {
 
     omp_set_num_threads(num_threads);
     auto s = std::chrono::high_resolution_clock::now();
-    index_bipartite.BuildRoarGraph(sq_num, aligned_data_sq, base_num, aligned_data_bp, parameters);
+    // base_num=base_num * 0.95;
+    index_bipartite.BuildRoarGraph(sq_num, aligned_data_sq, base_num * 0.1, aligned_data_bp, parameters);
 
     auto e = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = e - s;
