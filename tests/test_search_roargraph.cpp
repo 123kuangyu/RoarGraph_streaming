@@ -186,6 +186,7 @@ int main(int argc, char **argv) {
     if (!evaluation_save_path.empty()) {
         evaluation_out.open(evaluation_save_path, std::ios::out);
     }
+    
     std::cout << "Using thread: " << num_threads << std::endl;
     std::cout << "L_pq" << "\t\tQPS" << "\t\t\tavg_visited" << "\tmean_latency" << "\trecall@" << k << "\tavg_hops" << std::endl;
     for (uint32_t L_pq : L_vec) {
