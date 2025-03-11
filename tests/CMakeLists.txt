@@ -25,3 +25,7 @@ target_link_libraries(test_only_build_bipartite ${GTEST_LIBRARIES} pthread ${PRO
 
 add_executable(test_search_bipartite test_search_bipartite.cpp)
 target_link_libraries(test_search_bipartite ${GTEST_LIBRARIES} pthread ${PROJECT_NAME}  Boost::program_options)
+
+# Add test_insert_roargraph executable
+add_executable(test_insert_roargraph test_insert_roargraph.cpp)
+target_link_libraries(test_insert_roargraph ${GTEST_LIBRARIES} pthread ${PROJECT_NAME} Boost::program_options)

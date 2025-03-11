@@ -19,6 +19,9 @@
 #include "efanna2e/exceptions.h"
 #include "efanna2e/parameters.h"
 
+#include <vector>
+#include <unordered_set>
+
 // define likely unlikely
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -37,7 +40,1040 @@ IndexBipartite::IndexBipartite(const size_t dimension, const size_t n, Metric m,
     }
 }
 
+
+
 IndexBipartite::~IndexBipartite() {}
+
+
+void IndexBipartite::InsertIntoRoarGraph(const float* new_vectors,  //起始向量
+                                        const size_t* ids,
+                                        size_t num_vectors, 
+                                        const Parameters& parameters) {
+    uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+    uint32_t num_threads = parameters.Get<uint32_t>("num_threads");
+    omp_set_num_threads(num_threads);
+    
+    std::cout << "Starting insertion of " << num_vectors << " vectors.." << std::endl;
+    std::cout << "Current projection_graph_ size: " << projection_graph_.size() << std::endl;
+    std::cout << "The size of bipartite_graph_: " << bipartite_graph_.size() << std::endl;
+    
+    // 验证必要的数据结构
+    if (data_sq_ == nullptr || data_bp_ == nullptr || projection_graph_.empty()) {
+        throw std::runtime_error("Required data structures not initialized");
+    }
+
+    const size_t k = 100;
+    std::vector<uint32_t> nearest_queries(num_vectors);
+    std::vector<float> nearest_distances(num_vectors);
+    bool base_has_query = false;
+    uint32_t step1, step2, step3;
+
+#pragma omp parallel for schedule(static, 100)
+    for (size_t i = 0; i < num_vectors; i++) {
+        const float* curr_vector = new_vectors + i * dimension_;
+        size_t curr_id = ids[i];
+        
+        // 1. 在基向量图中找到最近邻
+        std::vector<float> base_dists(k);
+        std::vector<unsigned> base_indices(k);
+        SearchRoarGraph(curr_vector, k, curr_id, parameters, base_indices.data(), base_dists);
+
+        // 2. 在top-k基础节点中寻找第一个有效的（与查询节点相连的）基础节点
+        std::vector<uint32_t> connected_queries; //基节点相连的查询节点并且是双向检查
+        bool found_connection = false;  
+        bool has_query = false; //第一步的tag
+        bool has_connection = false; //第二步的tag
+        uint32_t curr_base = 0;
+        // 2.1 首先检查所有top-k基础节点的入边
+        for(size_t j = 0; j < k && !found_connection; j++) {
+            curr_base = base_indices[j];
+            const auto& base_out_edges = bipartite_graph_[curr_base];
+            uint32_t query_id = 0;
+            if (!base_out_edges.empty()) {
+                for(const auto& q : base_out_edges) {  //当前基础节点的入边就一个在二分图中
+                    if(!has_query){
+                        has_query = true;
+                        found_connection = true;
+                    }
+                    query_id = q - u32_nd_;
+                    connected_queries.push_back(query_id);
+                    
+                }
+            }
+        }
+        
+        // 2.2 只有在第一步没找到任何连接时，才检查查询节点的入边
+        if (!found_connection) {
+            // 按距离排序检查top-k个基础节点
+            for(size_t j = 0; j < k && !found_connection; j++) {
+                curr_base = base_indices[j];
+                
+                // 直接检查查询节点，避免创建大型临时数据结构
+                for(uint32_t q = u32_nd_; q < total_pts_ && !found_connection; q++) {
+                    const auto& q_neighbors = bipartite_graph_[q];
+                    // 使用二分查找来提高查找效率
+                    if(!q_neighbors.empty() && 
+                       std::binary_search(q_neighbors.begin(), q_neighbors.end(), curr_base)) {
+                        uint32_t query_id = q - u32_nd_;
+                        connected_queries.push_back(query_id);
+                        found_connection = true;
+                        has_connection = true;
+                        
+                        // 找到一个连接后，检查同一个基础节点的其他查询节点连接
+                        for(uint32_t other_q = q + 1; other_q < total_pts_; other_q++) {
+                            const auto& other_neighbors = bipartite_graph_[other_q];
+                            if(!other_neighbors.empty() && 
+                               std::binary_search(other_neighbors.begin(), other_neighbors.end(), curr_base)) {
+                                connected_queries.push_back(other_q - u32_nd_);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2.3 在连接的查询节点中找到距离最近的
+        float min_dist = std::numeric_limits<float>::max();
+        uint32_t min_query_id = 0;
+        
+        if(found_connection) {
+            for(uint32_t q : connected_queries) {
+                const float* query_vector = data_sq_ + q * dimension_;
+                float dist = distance_->compare(curr_vector, query_vector, dimension_);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    min_query_id = q;
+                }
+            }
+            
+            // 更新二分图连接，便于下次插入
+            #pragma omp critical
+            {
+                if(has_query) {
+                    // 第一步找到的连接
+                    if(std::find(bipartite_graph_[curr_base].begin(), 
+                               bipartite_graph_[curr_base].end(), 
+                               min_query_id + u32_nd_) == bipartite_graph_[curr_base].end()) {
+                        bipartite_graph_[curr_base].push_back(min_query_id + u32_nd_);
+                    }
+                    base_has_query = true;
+                    step1++;
+                } else if(has_connection) {
+                    // 第二步找到的连接
+                    if(std::find(bipartite_graph_[min_query_id + u32_nd_].begin(),
+                               bipartite_graph_[min_query_id + u32_nd_].end(),
+                               curr_base) == bipartite_graph_[min_query_id + u32_nd_].end()) {
+                        bipartite_graph_[min_query_id + u32_nd_].push_back(curr_base);
+                    }
+                    base_has_query = true;
+                    step2++;
+                }
+            }
+        } else {
+            // 如果前两步都没找到连接，使用projection_graph_中的最近邻
+            #pragma omp critical
+            {
+                step3++;
+            }
+        }
+        
+        nearest_queries[i] = min_query_id;
+        nearest_distances[i] = min_dist;
+    }
+
+    std::cout << "step1: " << step1 << ", step2: " << step2 << ", step3: " << step3 << std::endl;
+    // 4. 扩展projection_graph_的大小
+    size_t current_size = projection_graph_.size();
+    size_t new_size = current_size + num_vectors;
+    {
+        std::unique_lock<std::mutex> lock(update_lock_);
+        projection_graph_.resize(new_size);
+        for (size_t i = current_size; i < new_size; ++i) {
+            projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
+        }
+    }
+
+    // 5. 基于预计算的最近邻进行实际插入    
+#pragma omp parallel for schedule(static, 100) 
+    for(size_t i=0; i< num_vectors; i++) {
+        const float* curr_vector = new_vectors + i * dimension_; //v
+        size_t curr_id = ids[i];
+        uint32_t sq = nearest_queries[i];  // 最近的训练查询向量id q
+        
+        // 使用learn_base_knn_构建候选集
+        std::vector<Neighbor> full_retset;
+        
+        if(base_has_query) {
+            // 如果前两步找到了有效的查询节点连接，使用learn_base_knn_
+            auto &nn_base = learn_base_knn_[sq];  // 获取查询向量的真值邻居 Nout(q)
+            
+            // 构建候选集 
+            bool has_valid_neighbor = false;
+            for (size_t j = 0; j < nn_base.size(); ++j) {
+                if (nn_base[j] >= new_size) continue;  // 邻居跳过超过建图大小的点
+                
+                float distance = distance_->compare(
+                    data_bp_ + dimension_ * (uint64_t)nn_base[j], 
+                    curr_vector,  
+                    dimension_
+                );
+                full_retset.push_back(Neighbor(nn_base[j], distance, false));
+                has_valid_neighbor = true;
+            }
+            
+            if (!has_valid_neighbor) {
+                #pragma omp critical
+                {
+                    std::cout << "\r跳过向量 " << curr_id << " ,因为查询向量 " << sq << " 没有有效邻居" << std::flush;
+                }
+                continue;
+            }
+        } else {
+            // 如果前两步都没找到有效连接，直接使用projection_graph_
+            
+            const auto& proj_neighbors = projection_graph_[sq];
+            bool has_valid_neighbor = false;
+            
+            for(const auto& neighbor_id : proj_neighbors) {
+                if(neighbor_id >= new_size) continue;
+                
+                float distance = distance_->compare(
+                    data_bp_ + dimension_ * (uint64_t)neighbor_id,
+                    curr_vector,
+                    dimension_
+                );
+                full_retset.push_back(Neighbor(neighbor_id, distance, false));
+                has_valid_neighbor = true;
+            }
+            
+            if(!has_valid_neighbor) {
+                #pragma omp critical
+                {
+                    std::cout << "\r跳过向量 " << curr_id << " ,因为projection_graph_中查询向量 " << sq << " 没有有效邻居" << std::flush;
+                }
+                continue;
+            }
+        }
+
+        std::vector<uint32_t> pruned_list;
+        pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
+        PruneBiSearchBaseGetBase(full_retset, curr_vector, curr_id, parameters, pruned_list);
+
+        // 更新RoarGraph
+        {
+            std::unique_lock<std::mutex> guard(locks_[curr_id]);
+            projection_graph_[curr_id] = pruned_list;
+        }
+        
+        // 添加反向边
+        ProjectionAddReverse(curr_id, parameters);
+        
+        if (i % 1000 == 0) {
+            std::cout << "\r" << (100.0 * i) / num_vectors << "% of insertion completed." << std::flush;
+        }
+    }
+
+
+    std::vector<uint32_t> vis_order(num_vectors);
+    for(size_t i=0; i<num_vectors; i++){
+        vis_order[i]=ids[i];
+    }
+
+#pragma omp parallel for schedule(static, 100)
+    for (uint32_t i = 0; i < vis_order.size(); ++i) {
+        uint32_t node = vis_order[i];
+        ProjectionAddReverse(node, parameters);
+    }
+
+#pragma omp parallel for schedule(static, 2048)
+    for (size_t i = 0; i < vis_order.size(); i++) {
+        size_t node = vis_order[i];
+        
+        // 如果节点的出边数超过限制，需要进行剪枝
+        if (projection_graph_[node].size() > M_pjbp) {
+            // 存储所有邻居节点及其距离信息
+            std::vector<Neighbor> full_retset;
+            tsl::robin_set<uint32_t> visited;
+            
+            // 遍历该节点的所有邻居
+            for (size_t j = 0; j < projection_graph_[node].size(); j++) {
+                if (visited.find(projection_graph_[node][j]) != visited.end()) {
+                    continue;
+                }
+                float distance = distance_->compare(
+                    data_bp_ + dimension_ * (size_t)projection_graph_[node][j],
+                    data_bp_ + dimension_ * (size_t)node, 
+                    dimension_);
+                visited.insert(projection_graph_[node][j]);
+                full_retset.push_back(Neighbor(projection_graph_[node][j], distance, false));
+            }
+            // 移除节点自身
+            for (size_t j = 0; j < full_retset.size(); j++) {
+                if (full_retset[j].id == node) {
+                    full_retset.erase(full_retset.begin() + j);
+                    j--;
+                }
+            }
+            // 剪枝
+            std::vector<uint32_t> prune_list;
+            PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * node, node, parameters, prune_list);
+            
+            // 更新图
+            {
+                std::unique_lock<std::mutex> guard(locks_[node]);
+                projection_graph_[node].clear();
+                projection_graph_[node] = prune_list;
+            }
+        }
+        
+    }
+
+}
+
+// //这个是用内存换取计算时间
+// void IndexBipartite::InsertIntoRoarGraph(const float* new_vectors,  //起始向量
+//                                         const size_t* ids,
+//                                         size_t num_vectors, 
+//                                         const Parameters& parameters) {
+//     uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+//     uint32_t num_threads = parameters.Get<uint32_t>("num_threads");
+//     omp_set_num_threads(num_threads);
+    
+//     std::cout << "Starting insertion of " << num_vectors << " vectors.." << std::endl;
+//     std::cout << "Current projection_graph_ size: " << projection_graph_.size() << std::endl;
+//     std::cout << "The size of bipartite_graph_: " << bipartite_graph_.size() << std::endl;
+    
+//     // 验证必要的数据结构
+//     if (data_sq_ == nullptr || data_bp_ == nullptr || projection_graph_.empty()) {
+//         throw std::runtime_error("Required data structures not initialized");
+//     }
+
+//     const size_t k = 100;
+//     std::vector<uint32_t> nearest_queries(num_vectors);
+//     std::vector<float> nearest_distances(num_vectors);
+//     uint32_t step1, step2, step3;
+//     bool base_has_query = false;
+
+// #pragma omp parallel for schedule(static, 100)
+//     for (size_t i = 0; i < num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_;
+//         size_t curr_id = ids[i];
+        
+//         // 1. 在基向量图中找到最近邻
+//         std::vector<float> base_dists(k);
+//         std::vector<unsigned> base_indices(k);
+//         SearchRoarGraph(curr_vector, k, curr_id, parameters, base_indices.data(), base_dists);
+
+//         // 2. 在top-k基础节点中寻找第一个有效的（与查询节点相连的）基础节点
+//         std::vector<uint32_t> connected_queries; //基节点相连的查询节点并且是双向检查
+//         bool found_connection = false;  
+    
+//         bool has_query = false; //第一步的tag
+//         bool has_connection = false; //第二步的tag
+//         uint32_t curr_base = 0;
+//         // 2.1 首先检查所有top-k基础节点的入边
+//         for(size_t j = 0; j < k && !found_connection; j++) {
+//             curr_base = base_indices[j];
+//             const auto& base_out_edges = bipartite_graph_[curr_base];
+//             uint32_t query_id = 0;
+//             if (!base_out_edges.empty()) {
+//                 for(const auto& q : base_out_edges) {  //当前基础节点的入边就一个在二分图中
+//                     if(!has_query){
+//                         has_query = true;
+//                         found_connection = true;
+//                     }
+//                     query_id = q - u32_nd_;
+//                     connected_queries.push_back(query_id);
+                    
+//                 }
+//             }
+//         }
+        
+//         // 2.2 只有在第一步没找到任何连接时，才检查查询节点的入边
+//         if (!found_connection) {// 首先按照距离顺序检查每个基础节点
+//             std::vector<std::unordered_set<uint32_t>> query_neighbors(total_pts_-u32_nd_);
+//             #pragma omp parallel for
+//             for(uint32_t q=u32_nd_; q<total_pts_; q++){
+//                 uint32_t query_id = q-u32_nd_;
+//                 const auto& q_neighbors = bipartite_graph_[q];
+//                 query_neighbors[query_id].insert(q_neighbors.begin(), q_neighbors.end());
+//             }
+
+//            //按距离排序检查top-k个基础节点
+//            for(size_t j=0; j<k && !found_connection; j++){
+//                curr_base = base_indices[j];
+
+//                //检查每个节点是否连接当前基础节点
+//                for(uint32_t q=0; q<total_pts_ - u32_nd_; q++){
+//                     if(query_neighbors[q].count(curr_base) > 0){
+//                         if(!has_connection) {  // 第一次找到连接
+//                             found_connection = true;
+//                             has_connection = true;
+//                         }
+//                         connected_queries.push_back(q);
+//                     }
+//                }
+//            }
+//         }
+
+//         // 2.3 在连接的查询节点中找到距离最近的
+//         float min_dist = std::numeric_limits<float>::max();
+//         uint32_t min_query_id = 0;
+        
+//         if(found_connection) {
+//             for(uint32_t q : connected_queries) {
+//                 const float* query_vector = data_sq_ + q * dimension_;
+//                 float dist = distance_->compare(curr_vector, query_vector, dimension_);
+//                 if (dist < min_dist) {
+//                     min_dist = dist;
+//                     min_query_id = q;
+//                 }
+//             }
+            
+//             // 更新二分图连接，便于下次插入
+//             #pragma omp critical
+//             {
+//                 if(has_query) {
+//                     // 第一步找到的连接
+//                     if(std::find(bipartite_graph_[curr_base].begin(), 
+//                                bipartite_graph_[curr_base].end(), 
+//                                min_query_id + u32_nd_) == bipartite_graph_[curr_base].end()) {
+//                         bipartite_graph_[curr_base].push_back(min_query_id + u32_nd_);
+//                     }
+//                     base_has_query = true;
+//                     step1++;
+//                 } else if(has_connection) {
+//                     // 第二步找到的连接
+//                     if(std::find(bipartite_graph_[min_query_id + u32_nd_].begin(),
+//                                bipartite_graph_[min_query_id + u32_nd_].end(),
+//                                curr_base) == bipartite_graph_[min_query_id + u32_nd_].end()) {
+//                         bipartite_graph_[min_query_id + u32_nd_].push_back(curr_base);
+//                     }
+//                     base_has_query = true;
+//                     step2++;
+//                 }
+//             }
+//         } else {
+//             // 如果前两步都没找到连接，使用projection_graph_中的最近邻
+//             #pragma omp critical
+//             {
+//                 step3++;
+//             }
+//         }
+        
+//         nearest_queries[i] = min_query_id;
+//         nearest_distances[i] = min_dist;
+//     }
+
+//     std::cout << "step1: " << step1 << ", step2: " << step2 << ", step3: " << step3 << std::endl;
+//     // 4. 扩展projection_graph_的大小
+//     size_t current_size = projection_graph_.size();
+//     size_t new_size = current_size + num_vectors;
+//     {
+//         std::unique_lock<std::mutex> lock(update_lock_);
+//         projection_graph_.resize(new_size);
+//         for (size_t i = current_size; i < new_size; ++i) {
+//             projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
+//         }
+//     }
+
+//     // 5. 基于预计算的最近邻进行实际插入    
+// #pragma omp parallel for schedule(static, 100) 
+//     for(size_t i=0; i< num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_; //v
+//         size_t curr_id = ids[i];
+//         uint32_t sq = nearest_queries[i];  // 最近的训练查询向量id q
+        
+//         // 使用learn_base_knn_构建候选集
+//         std::vector<Neighbor> full_retset;
+        
+//         if(base_has_query) {
+//             // 如果前两步找到了有效的查询节点连接，使用learn_base_knn_
+//             auto &nn_base = learn_base_knn_[sq];  // 获取查询向量的真值邻居 Nout(q)
+            
+//             // 构建候选集 
+//             bool has_valid_neighbor = false;
+//             for (size_t j = 0; j < nn_base.size(); ++j) {
+//                 if (nn_base[j] >= new_size) continue;  // 邻居跳过超过建图大小的点
+                
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (uint64_t)nn_base[j], 
+//                     curr_vector,  
+//                     dimension_
+//                 );
+//                 full_retset.push_back(Neighbor(nn_base[j], distance, false));
+//                 has_valid_neighbor = true;
+//             }
+            
+//             if (!has_valid_neighbor) {
+//                 #pragma omp critical
+//                 {
+//                     std::cout << "\r跳过向量 " << curr_id << " ,因为查询向量 " << sq << " 没有有效邻居" << std::flush;
+//                 }
+//                 continue;
+//             }
+//         } else {
+//             // 如果前两步都没找到有效连接，直接使用projection_graph_
+            
+//             const auto& proj_neighbors = projection_graph_[sq];
+//             bool has_valid_neighbor = false;
+            
+//             for(const auto& neighbor_id : proj_neighbors) {
+//                 if(neighbor_id >= new_size) continue;
+                
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (uint64_t)neighbor_id,
+//                     curr_vector,
+//                     dimension_
+//                 );
+//                 full_retset.push_back(Neighbor(neighbor_id, distance, false));
+//                 has_valid_neighbor = true;
+//             }
+            
+//             if(!has_valid_neighbor) {
+//                 #pragma omp critical
+//                 {
+//                     std::cout << "\r跳过向量 " << curr_id << " ,因为projection_graph_中查询向量 " << sq << " 没有有效邻居" << std::flush;
+//                 }
+//                 continue;
+//             }
+//         }
+
+//         std::vector<uint32_t> pruned_list;
+//         pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
+//         PruneBiSearchBaseGetBase(full_retset, curr_vector, curr_id, parameters, pruned_list);
+
+//         // 更新RoarGraph
+//         {
+//             std::unique_lock<std::mutex> guard(locks_[curr_id]);
+//             projection_graph_[curr_id] = pruned_list;
+//         }
+        
+//         // 添加反向边
+//         ProjectionAddReverse(curr_id, parameters);
+        
+//         if (i % 1000 == 0) {
+//             std::cout << "\r" << (100.0 * i) / num_vectors << "% of insertion completed." << std::flush;
+//         }
+//     }
+
+
+//     std::vector<uint32_t> vis_order(num_vectors);
+//     for(size_t i=0; i<num_vectors; i++){
+//         vis_order[i]=ids[i];
+//     }
+
+// #pragma omp parallel for schedule(static, 100)
+//     for (uint32_t i = 0; i < vis_order.size(); ++i) {
+//         uint32_t node = vis_order[i];
+//         ProjectionAddReverse(node, parameters);
+//     }
+
+// #pragma omp parallel for schedule(static, 2048)
+//     for (size_t i = 0; i < vis_order.size(); i++) {
+//         size_t node = vis_order[i];
+        
+//         // 如果节点的出边数超过限制，需要进行剪枝
+//         if (projection_graph_[node].size() > M_pjbp) {
+//             // 存储所有邻居节点及其距离信息
+//             std::vector<Neighbor> full_retset;
+//             tsl::robin_set<uint32_t> visited;
+            
+//             // 遍历该节点的所有邻居
+//             for (size_t j = 0; j < projection_graph_[node].size(); j++) {
+//                 if (visited.find(projection_graph_[node][j]) != visited.end()) {
+//                     continue;
+//                 }
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (size_t)projection_graph_[node][j],
+//                     data_bp_ + dimension_ * (size_t)node, 
+//                     dimension_);
+//                 visited.insert(projection_graph_[node][j]);
+//                 full_retset.push_back(Neighbor(projection_graph_[node][j], distance, false));
+//             }
+//             // 移除节点自身
+//             for (size_t j = 0; j < full_retset.size(); j++) {
+//                 if (full_retset[j].id == node) {
+//                     full_retset.erase(full_retset.begin() + j);
+//                     j--;
+//                 }
+//             }
+//             // 剪枝
+//             std::vector<uint32_t> prune_list;
+//             PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * node, node, parameters, prune_list);
+            
+//             // 更新图
+//             {
+//                 std::unique_lock<std::mutex> guard(locks_[node]);
+//                 projection_graph_[node].clear();
+//                 projection_graph_[node] = prune_list;
+//             }
+//         }
+        
+//     }
+
+// }
+
+
+// void IndexBipartite::InsertIntoRoarGraph(const float* new_vectors,  //起始向量
+//                                         const size_t* ids,
+//                                         size_t num_vectors, 
+//                                         const Parameters& parameters) {
+//     uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+//     uint32_t num_threads = parameters.Get<uint32_t>("num_threads");
+//     omp_set_num_threads(num_threads);
+    
+//     std::cout << "Starting insertion of " << num_vectors << " vectors.." << std::endl;
+//     std::cout << "Current projection_graph_ size: " << projection_graph_.size() << std::endl;
+//     std::cout << "The size of bipartite_graph_: " << bipartite_graph_.size() << std::endl;
+
+//     // 验证必要的数据结构
+//     if (data_sq_ == nullptr || data_bp_ == nullptr || projection_graph_.empty()) {
+//         throw std::runtime_error("Required data structures not initialized");
+//     }
+
+//     std::cout << "M_pjbp: " << M_pjbp << std::endl;
+//     std::cout << "locks_.size(): " << locks_.size() << std::endl;
+//     std::cout<<"load projection_graph_ size: "<<projection_graph_.size()<<std::endl;
+//     std::cout<<"u32_nd_: "<<u32_nd_<<std::endl;
+//     std::cout<<"num_vectors: "<<num_vectors<<std::endl;
+    
+    
+//     const size_t k = 100;
+//     // BipartiteProjectionReserveSpace(parameters);
+
+//     std::vector<uint32_t> nearest_queries(num_vectors);
+//     std::vector<float> nearest_distances(num_vectors);
+//     bool found_connection = false;
+
+// #pragma omp parallel for schedule(static, 100)
+//     for (size_t i = 0; i < num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_;
+//         size_t curr_id = ids[i];
+//         if (curr_vector == nullptr ) {
+//             throw std::runtime_error("Required data structures not initialized");
+//         }
+
+//         // 1. 在基向量图中找到最近邻
+//         std::vector<float> base_dists(k, 0.0f);
+//         std::vector<unsigned> base_indices(k, 0);
+//         SearchRoarGraph(curr_vector, k, curr_id, parameters, base_indices.data(), base_dists);
+//         // 2. 在top-k基础节点中寻找第一个有效的（与查询节点相连的）基础节点
+//         uint32_t valid_base = 0;
+//         std::vector<uint32_t> connected_queries; //基节点相连的查询节点并且是双向检查
+
+//         // 2.1 首先检查所有top-k基础节点的出边
+//         for(size_t j = 0; j < k && !found_connection; j++) {
+//             uint32_t curr_base = base_indices[j];
+//             const auto& base_out_edges = bipartite_graph_[curr_base];
+            
+//             if (!base_out_edges.empty()) {
+//                 bool has_query = false;
+//                 for(const auto& q : base_out_edges) {
+//                     if(q >= u32_nd_) {  // 确保是查询节点
+//                         uint32_t query_id = q - u32_nd_;
+//                         connected_queries.push_back(query_id);
+//                         found_connection = true;
+//                         valid_base = curr_base;
+//                         #pragma omp critical
+//                         {
+//                             std::cout << "在top-" << k << "中第 " << j+1 << " 个基础节点 " << curr_base 
+//                                      << " 找到 " << connected_queries.size() << " 个连接的查询节点" << std::endl;
+//                         }
+//                         break;  // 找到第一个有连接的基础节点就退出
+//                     }
+//                 }
+                
+//             } 
+//         }
+        
+//         // 2.2 只有在第一步没找到任何连接时，才检查查询节点的入边
+//         if (!found_connection) {// 首先按照距离顺序检查每个基础节点
+//             std::vector<std::unordered_set<uint32_t>> query_neighbors(total_pts_-u32_nd_);
+
+//             #pragma omp parallel for
+//             for(uint32_t q=u32_nd_; q<total_pts_; q++){
+//                 uint32_t query_id = q-u32_nd_;
+//                 const auto& q_neighbors = bipartite_graph_[q];
+//                 query_neighbors[query_id].insert(q_neighbors.begin(), q_neighbors.end());
+//             }
+
+//            //按距离排序检查top-k个基础节点
+//            for(size_t j=0; j<k && !found_connection; j++){
+//                uint32_t curr_base = base_indices[j];
+//                bool has_connect =false;
+
+//                //检查每个节点是否连接当前基础节点
+//                for(uint32_t q=0; q<total_pts_ - u32_nd_; q++){
+//                     if(query_neighbors[q].count(curr_base) > 0){
+//                         if(!has_connect){ // 第一次找到查询q就设置参数
+//                             found_connection = true;
+//                             valid_base = curr_base;
+//                             has_connect = true;
+
+//                         }
+//                         connected_queries.push_back(q);
+//                     }
+//                }
+//                if(has_connect){
+//                     #pragma omp critical
+//                     {
+//                         std::cout <<"在第二部检查中，第"<<j+1 <<"近的基础节点"<<curr_base
+//                                 <<"连接了"<<connected_queries.size()<<"个查询节点"<<std::endl;
+//                     }
+//                }
+//            }
+//         }
+
+//         // 3. 在连接的查询节点中找到距离最近的
+//         float min_dist = std::numeric_limits<float>::max();
+//         uint32_t min_query_id = 0;
+        
+//         if(found_connection) {
+//             for(uint32_t q : connected_queries) {
+//                 const float* query_vector = data_sq_ + q * dimension_;
+//                 float dist = distance_->compare(curr_vector, query_vector, dimension_);
+//                 if (dist < min_dist) {
+//                     min_dist = dist;
+//                     min_query_id = q;
+//                 }
+//             }
+//         } else {
+//             #pragma omp critical
+//             {
+//                 std::cout << "前2步检查中都没有找到与查询节点相连的基础节点" << std::endl;
+//             }
+//         }
+        
+//         nearest_queries[i] = min_query_id;
+//         nearest_distances[i] = min_dist;
+//     }
+
+//     // 4. 扩展projection_graph_的大小
+//     size_t current_size = projection_graph_.size();
+//     size_t new_size = current_size + num_vectors;
+//     {
+//         std::unique_lock<std::mutex> lock(update_lock_);
+//         projection_graph_.resize(new_size);
+//         for (size_t i = current_size; i < new_size; ++i) {
+//             projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
+//         }
+//     }
+
+//     // 5. 基于预计算的最近邻进行实际插入    
+// #pragma omp parallel for schedule(static, 100) 
+//     for(size_t i=0; i< num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_; //v
+//         size_t curr_id = ids[i];
+//         uint32_t sq = nearest_queries[i];  // 最近的训练查询向量id q
+        
+//         // 使用learn_base_knn_构建候选集
+//         std::vector<Neighbor> full_retset;
+        
+//         if(found_connection) {
+//             // 如果前两步找到了有效的查询节点连接，使用learn_base_knn_
+//             auto &nn_base = learn_base_knn_[sq];  // 获取查询向量的真值邻居 Nout(q)
+            
+//             // 构建候选集 
+//             bool has_valid_neighbor = false;
+//             for (size_t j = 0; j < nn_base.size(); ++j) {
+//                 if (nn_base[j] >= current_size) continue;  // 邻居跳过超过初始图大小
+                
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (uint64_t)nn_base[j], 
+//                     curr_vector,  
+//                     dimension_
+//                 );
+//                 full_retset.push_back(Neighbor(nn_base[j], distance, false));
+//                 has_valid_neighbor = true;
+//             }
+            
+//             if (!has_valid_neighbor) {
+//                 #pragma omp critical
+//                 {
+//                     std::cout << "\r跳过向量 " << curr_id << " ,因为查询向量 " << sq << " 没有有效邻居" << std::flush;
+//                 }
+//                 continue;
+//             }
+//         } else {
+//             // 如果前两步都没找到有效连接，直接使用projection_graph_
+//             #pragma omp critical
+//             {
+//                 std::cout << "\r向量 " << curr_id << " 使用projection_graph_作为备选方案" << std::flush;
+//             }
+            
+//             const auto& proj_neighbors = projection_graph_[sq];
+//             bool has_valid_neighbor = false;
+            
+//             for(const auto& neighbor_id : proj_neighbors) {
+//                 if(neighbor_id >= current_size) continue;
+                
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (uint64_t)neighbor_id,
+//                     curr_vector,
+//                     dimension_
+//                 );
+//                 full_retset.push_back(Neighbor(neighbor_id, distance, false));
+//                 has_valid_neighbor = true;
+//             }
+            
+//             if(!has_valid_neighbor) {
+//                 #pragma omp critical
+//                 {
+//                     std::cout << "\r跳过向量 " << curr_id << " ,因为projection_graph_中查询向量 " << sq << " 没有有效邻居" << std::flush;
+//                 }
+//                 continue;
+//             }
+//         }
+
+//         std::vector<uint32_t> pruned_list;
+//         pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
+//         PruneBiSearchBaseGetBase(full_retset, curr_vector, curr_id, parameters, pruned_list);
+
+//         // 将当前向量添加到查询向量的真值邻居列表中 - 只对写操作加锁
+//         {
+//             std::unique_lock<std::mutex> guard(locks_[sq]);
+//             if(found_connection) {
+//                 learn_base_knn_[sq].push_back(curr_id);
+//             }
+//         }
+
+//         // 更新RoarGraph
+//         {
+//             std::unique_lock<std::mutex> guard(locks_[curr_id]);
+//             projection_graph_[curr_id] = pruned_list;
+//         }
+        
+//         // 添加反向边
+//         ProjectionAddReverse(curr_id, parameters);
+        
+//         if (i % 1000 == 0) {
+//             std::cout << "\r" << (100.0 * i) / num_vectors << "% of insertion completed." << std::flush;
+//         }
+//     }
+
+
+//     std::vector<uint32_t> vis_order(num_vectors);
+//     for(size_t i=0; i<num_vectors; i++){
+//         vis_order[i]=ids[i];
+//     }
+
+// #pragma omp parallel for schedule(static, 100)
+//     for (uint32_t i = 0; i < vis_order.size(); ++i) {
+//         uint32_t node = vis_order[i];
+//         ProjectionAddReverse(node, parameters);
+//     }
+
+// #pragma omp parallel for schedule(static, 2048)
+//     for (size_t i = 0; i < vis_order.size(); i++) {
+//         size_t node = vis_order[i];
+        
+//         // 如果节点的出边数超过限制，需要进行剪枝
+//         if (projection_graph_[node].size() > M_pjbp) {
+//             // 存储所有邻居节点及其距离信息
+//             std::vector<Neighbor> full_retset;
+//             tsl::robin_set<uint32_t> visited;
+            
+//             // 遍历该节点的所有邻居
+//             for (size_t j = 0; j < projection_graph_[node].size(); j++) {
+//                 if (visited.find(projection_graph_[node][j]) != visited.end()) {
+//                     continue;
+//                 }
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (size_t)projection_graph_[node][j],
+//                     data_bp_ + dimension_ * (size_t)node, 
+//                     dimension_);
+//                 visited.insert(projection_graph_[node][j]);
+//                 full_retset.push_back(Neighbor(projection_graph_[node][j], distance, false));
+//             }
+//             // 移除节点自身
+//             for (size_t j = 0; j < full_retset.size(); j++) {
+//                 if (full_retset[j].id == node) {
+//                     full_retset.erase(full_retset.begin() + j);
+//                     j--;
+//                 }
+//             }
+//             // 剪枝
+//             std::vector<uint32_t> prune_list;
+//             PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * node, node, parameters, prune_list);
+            
+//             // 更新图
+//             {
+//                 std::unique_lock<std::mutex> guard(locks_[node]);
+//                 projection_graph_[node].clear();
+//                 projection_graph_[node] = prune_list;
+//             }
+//         }
+        
+//     }
+
+// }
+
+
+// void IndexBipartite::InsertIntoRoarGraph(const float* new_vectors, 
+//                                         const size_t* ids,
+//                                         size_t num_vectors, 
+//                                         const Parameters& parameters) {
+//     uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+//     uint32_t num_threads = parameters.Get<uint32_t>("num_threads");
+//     omp_set_num_threads(parameters.Get<uint32_t>("num_threads"));
+  
+//     std::cout << "Starting insertion of " << num_vectors << " vectors.." << std::endl;
+//     std::cout<<"load projection_graph_ size: "<<projection_graph_.size()<<std::endl;
+//     const size_t k=1;
+
+//     std::cout << "M_pjbp: " << M_pjbp << std::endl;
+//     std::cout << "locks_.size(): " << locks_.size() << std::endl;
+//     std::cout<<"load projection_graph_ size: "<<projection_graph_.size()<<std::endl;
+//     std::cout<<"u32_nd_: "<<u32_nd_<<std::endl;
+//     // {
+//     //     std::unique_lock<std::mutex> lock(update_lock_);  // 使用互斥锁保护更新
+//     //     if (projection_graph_.size() < nd_) {
+//     //         projection_graph_.resize(nd_);
+//     //         std::cout << "Resized projection_graph_ to: " << projection_graph_.size() << std::endl;
+//     //     }
+//     // }
+//     std::vector<uint32_t> nearest_queries(num_vectors);
+//     std::vector<float> nearest_distances(num_vectors);
+// // 1. 预先计算所有待插入向量在初始图中的最近邻
+// #pragma omp parallel for schedule(static, 100)
+//     for (size_t i = 0; i < num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_; //v作为查询向量
+//         size_t curr_id = ids[i];
+
+//         std::vector<float> dists(k, 0.0f);
+//         std::vector<unsigned> nn_indices(k, 0);
+
+//         SearchRoarGraph(curr_vector, k, curr_id, parameters, nn_indices.data(), dists);
+        
+//         nearest_queries[i] = nn_indices[0];
+//         nearest_distances[i] = dists[0];
+
+//         if(nearest_queries[i] >= projection_graph_.size()){ //检查建立的初始图
+//             std::cout<<"查询id为："<< curr_id <<"超过的id为： "<<nearest_queries[i] << std::endl;
+//         }
+
+//     }
+    
+//     // 2. 在搜索完成后再扩展projection_graph_
+//     size_t current_size = projection_graph_.size();
+//     size_t new_size = current_size + num_vectors;
+//     {
+//         std::unique_lock<std::mutex> lock(update_lock_);
+//         projection_graph_.resize(new_size);
+//         for (size_t i = current_size; i < new_size; ++i) {
+//             projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
+//         }
+//     }
+//     std::cout<<"Supplied projection_graph_ size: "<<projection_graph_.size()<<std::endl;
+    
+// // 3. 基于预计算的最近邻进行实际插入    
+// #pragma omp parallel for schedule(static, 100) 
+//     for(size_t i=0; i< num_vectors; i++) {
+//         const float* curr_vector = new_vectors + i * dimension_;
+//         size_t curr_id = ids[i];
+//         uint32_t nearest_query = nearest_queries[i];
+//         // //验证线程安全
+//         // if(nearest_query >= num_vectors){ //build 
+//         //     std::cout<<"查询id为："<< curr_id <<"超过的id为： "<<nearest_query << std::endl;
+//         //     continue;
+//         // }
+//         if(nearest_query >= current_size){
+//             std::cout<<"查询id为："<< curr_id <<"超过的id为： "<< nearest_query << std::endl;
+//             continue;
+//         }
+
+//         // 构建候选集
+        
+//         std::vector<Neighbor> full_retset;
+//         {
+//             std::unique_lock<std::mutex> guard(locks_[nearest_query]);
+//             const auto& q_neighbors = projection_graph_[nearest_query];  //N_out(q)
+
+//             for (size_t j = 0; j < q_neighbors.size(); ++j) {
+//                 if (q_neighbors[j] == nearest_query) continue;
+//                 float distance = distance_->compare(curr_vector,
+//                                                 data_bp_ + dimension_ * q_neighbors[j],
+//                                                 dimension_);
+//                 full_retset.push_back(Neighbor(q_neighbors[j], distance, false));
+//             }
+//         }
+
+//         // 对候选集进行剪枝
+//         std::vector<uint32_t> pruned_list;
+//         pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
+//         PruneBiSearchBaseGetBase(full_retset, curr_vector, curr_id, parameters, pruned_list);
+
+//         //  更新RoarGraph
+//         {
+//             std::unique_lock<std::mutex> guard(locks_[curr_id]);
+//             projection_graph_[curr_id] = pruned_list;
+//         }
+//         //  添加反向边
+//         ProjectionAddReverse(curr_id, parameters);
+//         if (i % 1000 == 0) {
+//             std::cout << "\r" << (100.0 * i) / num_vectors << "% of projection search bipartite by base completed."
+//                       << std::flush;
+//         }
+//     }
+
+//     std::vector<uint32_t> vis_order(num_vectors);
+//     for(size_t i=0; i<num_vectors; i++){
+//         vis_order[i]=ids[i];
+//     }
+
+// #pragma omp parallel for schedule(static, 100)
+//     for (uint32_t i = 0; i < vis_order.size(); ++i) {
+//         uint32_t node = vis_order[i];
+//         ProjectionAddReverse(node, parameters);
+//     }
+
+// #pragma omp parallel for schedule(static, 2048)
+//     for (size_t i = 0; i < vis_order.size(); i++) {
+//         size_t node = vis_order[i];
+        
+//         // 如果节点的出边数超过限制，需要进行剪枝
+//         if (projection_graph_[node].size() > M_pjbp) {
+//             // 存储所有邻居节点及其距离信息
+//             std::vector<Neighbor> full_retset;
+//             tsl::robin_set<uint32_t> visited;
+            
+//             // 遍历该节点的所有邻居
+//             for (size_t j = 0; j < projection_graph_[node].size(); j++) {
+//                 if (visited.find(projection_graph_[node][j]) != visited.end()) {
+//                     continue;
+//                 }
+//                 float distance = distance_->compare(
+//                     data_bp_ + dimension_ * (size_t)projection_graph_[node][j],
+//                     data_bp_ + dimension_ * (size_t)node, 
+//                     dimension_);
+//                 visited.insert(projection_graph_[node][j]);
+//                 full_retset.push_back(Neighbor(projection_graph_[node][j], distance, false));
+//             }
+//             // 移除节点自身
+//             for (size_t j = 0; j < full_retset.size(); j++) {
+//                 if (full_retset[j].id == node) {
+//                     full_retset.erase(full_retset.begin() + j);
+//                     j--;
+//                 }
+//             }
+//             // 剪枝
+//             std::vector<uint32_t> prune_list;
+//             PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * node, node, parameters, prune_list);
+            
+//             // 更新图
+//             {
+//                 std::unique_lock<std::mutex> guard(locks_[node]);
+//                 projection_graph_[node].clear();
+//                 projection_graph_[node] = prune_list;
+//             }
+//         }
+        
+//     }
+
+// }
+
+
 
 void IndexBipartite::BuildBipartite(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
                                     const Parameters &parameters) {
@@ -102,47 +1138,163 @@ void IndexBipartite::BuildBipartite(size_t n_sq, const float *sq_data, size_t n_
     auto diff = e - s;
     std::cout << "Build projection graph time: " << diff.count() / (1000 * 1000 * 1000) << std::endl;
 
-    for (i = 0; i < projection_graph_.size(); ++i) {
-        std::vector<uint32_t> &nbrs = projection_graph_[i];
-        projection_degree_avg += static_cast<float>(nbrs.size());
-        projection_degree_max = std::max(projection_degree_max, nbrs.size());
-        projection_degree_min = std::min(projection_degree_min, nbrs.size());
-    }
-    std::cout << "total degree: " << projection_degree_avg << std::endl;
-    std::cout << "Projection degree avg: " << projection_degree_avg / (float)u32_nd_ << std::endl;
-    std::cout << "Projection degree max: " << projection_degree_max << std::endl;
-    std::cout << "Projection degree min: " << projection_degree_min << std::endl;
+    // for (i = 0; i < projection_graph_.size(); ++i) {
+    //     std::vector<uint32_t> &nbrs = projection_graph_[i];
+    //     projection_degree_avg += static_cast<float>(nbrs.size());
+    //     projection_degree_max = std::max(projection_degree_max, nbrs.size());
+    //     projection_degree_min = std::min(projection_degree_min, nbrs.size());
+    // }
+    // std::cout << "total degree: " << projection_degree_avg << std::endl;
+    // std::cout << "Projection degree avg: " << projection_degree_avg / (float)u32_nd_ << std::endl;
+    // std::cout << "Projection degree max: " << projection_degree_max << std::endl;
+    // std::cout << "Projection degree min: " << projection_degree_min << std::endl;
 
     // statistics of bipartite_graph_
     float max_degree_nd = 0, min_degree_nd = std::numeric_limits<float>::max(), avg_degree_nd = 0;
     float max_degree_nd_sq = 0, min_degree_nd_sq = std::numeric_limits<float>::max(), avg_degree_nd_sq = 0;
+    size_t no_neighbor_base = 0;  // 统计没有邻居的基础节点数量
+    size_t no_neighbor_query = 0;  // 统计没有邻居的查询节点数量
+    std::vector<size_t> empty_base_ids;  // 记录没有邻居的基础节点ID
+    std::vector<size_t> empty_query_ids; // 记录没有邻居的查询节点ID
+
     for (size_t i = 0; i < bipartite_graph_.size(); ++i) {
         auto &nbrs = bipartite_graph_[i];
         if (i < nd_) {
+            if(nbrs.empty()) {
+                no_neighbor_base++;
+                empty_base_ids.push_back(i);
+            }
             max_degree_nd = std::max(max_degree_nd, static_cast<float>(nbrs.size()));
             min_degree_nd = std::min(min_degree_nd, static_cast<float>(nbrs.size()));
             avg_degree_nd += static_cast<float>(nbrs.size());
         } else {
+            if(nbrs.empty()) {
+                no_neighbor_query++;
+                empty_query_ids.push_back(i - nd_);  // 转换为相对查询节点的ID
+            }
             max_degree_nd_sq = std::max(max_degree_nd_sq, static_cast<float>(nbrs.size()));
             min_degree_nd_sq = std::min(min_degree_nd_sq, static_cast<float>(nbrs.size()));
             avg_degree_nd_sq += static_cast<float>(nbrs.size());
         }
     }
-
+    
     std::cout << "Bipartite nd degree avg: " << avg_degree_nd / nd_ << std::endl;
     std::cout << "Bipartite nd degree max: " << max_degree_nd << std::endl;
     std::cout << "Bipartite nd degree min: " << min_degree_nd << std::endl;
+    std::cout << "Base nodes without neighbors: " << no_neighbor_base << " (" 
+              << (float)no_neighbor_base / nd_ * 100 << "%)" << std::endl;
 
     std::cout << "Bipartite nd_sq degree avg: " << avg_degree_nd_sq / nd_sq_ << std::endl;
     std::cout << "Bipartite nd_sq degree max: " << max_degree_nd_sq << std::endl;
     std::cout << "Bipartite nd_sq degree min: " << min_degree_nd_sq << std::endl;
+    std::cout << "Query nodes without neighbors: " << no_neighbor_query << " (" 
+              << (float)no_neighbor_query / nd_sq_ * 100 << "%)" << std::endl;
+
 
     has_built = true;
 }
 
+
+void IndexBipartite::BuildRoarGraphwithData(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
+    const Parameters &parameters) {
+// std::cout << "start build bipartite index" << std::endl;
+auto s = std::chrono::high_resolution_clock::now();
+uint32_t M_sq = parameters.Get<uint32_t>("M_sq");
+// uint32_t M_bp = parameters.Get<uint32_t>("M_bp");
+uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+// uint32_t L_pq = parameters.Get<uint32_t>("L_pq");
+// aligned and processed memory block for tow datasets
+
+//copy bp_data
+float *bp_data_copy = new float[n_bp * dimension_];
+memcpy(bp_data_copy, bp_data, n_bp * dimension_ * sizeof(float));
+data_bp_ = bp_data_copy;
+data_sq_ = sq_data;
+nd_ = n_bp;
+nd_sq_ = n_sq;
+total_pts_ = nd_ + nd_sq_;
+u32_nd_ = static_cast<uint32_t>(nd_);
+u32_nd_sq_ = static_cast<uint32_t>(nd_sq_);
+u32_total_pts_ = static_cast<uint32_t>(total_pts_);
+locks_ = std::vector<std::mutex>(total_pts_);
+// bp_en_flags_.reserve(u32_nd_);
+// sq_en_flags_.reserve(u32_nd_sq_);
+// bp_en_set_.get_allocator().allocate(200);
+// sq_en_set_.get_allocator().allocate(200);
+
+SetBipartiteParameters(parameters);
+// InitBipartiteGraph();
+// for (size_t i = 0; i < bipartite_graph_.size(); ++i) {
+//     if (i < nd_) {
+//         bipartite_graph_[i].reserve(((size_t)M_bp) * 1.5);
+//     } else {
+//         bipartite_graph_[i].reserve(((size_t)M_sq) * 1.5);
+//     }
+// }
+
+if (need_normalize) {
+std::cout << "normalizing base data" << std::endl;
+for (size_t i = 0; i < nd_; ++i) {
+float *data = const_cast<float *>(data_bp_);
+normalize(data + i * dimension_, dimension_);
+}
+}
+
+
+float bipartite_degree_avg = 0;
+size_t bipartite_degree_max = 0, bipartite_degree_min = std::numeric_limits<size_t>::max();
+float projection_degree_avg = 0;
+size_t projection_degree_max = 0, projection_degree_min = std::numeric_limits<size_t>::max();
+
+// std::mt19937 rng(time(nullptr));
+// std::uniform_int_distribution<uint32_t> base_dis(0, u32_nd_ - 1);
+
+size_t i = 0;
+
+supply_nbrs_.resize(nd_);
+// for (i = 0; i < nd_; ++i) {
+//     supply_nbrs_[i].reserve(M_pjbp * 1.5);
+// }
+
+// project bipartite
+BipartiteProjectionReserveSpace(parameters);
+
+CalculateProjectionep();
+
+assert(projection_ep_ < nd_);
+// std::cout << "begin link projection" << std::endl;
+LinkProjection(parameters);
+// std::cout << std::endl;
+// std::cout << "Starting collect points" << std::endl;
+// auto co_s = std::chrono::high_resolution_clock::now();
+// CollectPoints(parameters);
+// auto co_e = std::chrono::high_resolution_clock::now();
+// diff = co_e - co_s;
+// std::cout << "Collect points time: " << diff.count() << std::endl;
+
+// e = std::chrono::high_resolution_clock::now();
+auto e = std::chrono::high_resolution_clock::now();
+auto diff = e - s;
+// std::cout << "Build projection graph time: " << diff.count() / (1000 * 1000 * 1000) << std::endl;
+
+for (i = 0; i < projection_graph_.size(); ++i) {
+std::vector<uint32_t> &nbrs = projection_graph_[i];
+projection_degree_avg += static_cast<float>(nbrs.size());
+projection_degree_max = std::max(projection_degree_max, nbrs.size());
+projection_degree_min = std::min(projection_degree_min, nbrs.size());
+}
+// std::cout << "total degree: " << projection_degree_avg << std::endl;
+// std::cout << "Projection degree avg: " << projection_degree_avg / (float)u32_nd_ << std::endl;
+// std::cout << "Projection degree max: " << projection_degree_max << std::endl;
+// std::cout << "Projection degree min: " << projection_degree_min << std::endl;
+
+has_built = true;
+}
+
+//只需要用n_bp个数据建立索引和ep
 void IndexBipartite::BuildRoarGraph(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
                                     const Parameters &parameters) {
-    std::cout << "start build bipartite index" << std::endl;
+    std::cout << "start build RoarGraph index" << std::endl;
     auto s = std::chrono::high_resolution_clock::now();
     uint32_t M_sq = parameters.Get<uint32_t>("M_sq");
     // uint32_t M_bp = parameters.Get<uint32_t>("M_bp");
@@ -151,13 +1303,13 @@ void IndexBipartite::BuildRoarGraph(size_t n_sq, const float *sq_data, size_t n_
     // aligned and processed memory block for tow datasets
     data_bp_ = bp_data;
     data_sq_ = sq_data;
-    nd_ = n_bp;
+    nd_ = n_bp ;
     nd_sq_ = n_sq;
     total_pts_ = nd_ + nd_sq_;
     u32_nd_ = static_cast<uint32_t>(nd_);
     u32_nd_sq_ = static_cast<uint32_t>(nd_sq_);
     u32_total_pts_ = static_cast<uint32_t>(total_pts_);
-    locks_ = std::vector<std::mutex>(total_pts_);
+    locks_ = std::vector<std::mutex>(total_pts_ );
     // bp_en_flags_.reserve(u32_nd_);
     // sq_en_flags_.reserve(u32_nd_sq_);
     // bp_en_set_.get_allocator().allocate(200);
@@ -196,12 +1348,17 @@ void IndexBipartite::BuildRoarGraph(size_t n_sq, const float *sq_data, size_t n_
     // for (i = 0; i < nd_; ++i) {
     //     supply_nbrs_[i].reserve(M_pjbp * 1.5);
     // }
+    
+    std::cout << "dimension_: " << dimension_ << std::endl;
+    std::cout << "M_pjbp: " << M_pjbp << std::endl;
+    std::cout << "PROJECTION_SLACK: " << PROJECTION_SLACK << std::endl;
+    std::cout << "locks_.size(): " << locks_.size() << std::endl;
 
-    // project bipartite
+    // project bipartite 给投影图resize(nd_)
     BipartiteProjectionReserveSpace(parameters);
 
     CalculateProjectionep();
-
+   
     assert(projection_ep_ < nd_);
     std::cout << "begin link projection" << std::endl;
     LinkProjection(parameters);
@@ -230,6 +1387,7 @@ void IndexBipartite::BuildRoarGraph(size_t n_sq, const float *sq_data, size_t n_
     std::cout << "Projection degree min: " << projection_degree_min << std::endl;
 
     has_built = true;
+    
 }
 
 void IndexBipartite::qbaseNNbipartite(const Parameters &parameters) {
@@ -248,6 +1406,7 @@ void IndexBipartite::qbaseNNbipartite(const Parameters &parameters) {
     }
 
     bipartite_graph_.resize(u32_total_pts_);
+    base_learn_knn_.resize(u32_nd_);
 
 #pragma omp parallel for schedule(static, 100)
     for (uint32_t it_sq = 0; it_sq < u32_nd_sq_; ++it_sq) {
@@ -270,6 +1429,7 @@ void IndexBipartite::qbaseNNbipartite(const Parameters &parameters) {
         {
             LockGuard guard(locks_[cur_tgt]);
             bipartite_graph_[cur_tgt].push_back(sq + u32_nd_);
+            base_learn_knn_[cur_tgt].push_back(sq);
         }
         if (sq % 1000 == 0) {
             std::cout << "\r" << (100.0 * sq) / u32_nd_sq_ << "% of save bipartite graph finish"
@@ -955,6 +2115,7 @@ void IndexBipartite::BipartiteProjectionReserveSpace(const Parameters &parameter
     for (uint32_t i = 0; i < u32_nd_; ++i) {
         projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
     }
+    std::cout << " projection graph init is ended!" << std::endl;
 }
 
 void IndexBipartite::TrainingLink2Projection(const Parameters &parameters, SimpleNeighbor *simple_graph) {
@@ -1041,62 +2202,107 @@ void IndexBipartite::TrainingLink2Projection(const Parameters &parameters, Simpl
 }
 
 void IndexBipartite::LinkProjection(const Parameters &parameters) {
-    uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
+    uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp"); //35
     uint32_t L_pjpq = parameters.Get<uint32_t>("L_pjpq");
     uint32_t Nq = parameters.Get<uint32_t>("M_sq");
-
+    
+    // 验证必要的数据结构是否已初始化
+    if (learn_base_knn_.empty() || data_bp_ == nullptr || 
+        projection_graph_.empty() || locks_.empty()) {
+        throw std::runtime_error("Required data structures not initialized");
+    }
+    
+    
+    // {   
+    //     std::unique_lock<std::mutex> lock(update_lock_);  // 使用互斥锁保护更新
+        
+    //         projection_graph_.resize(nd_ * 2);
+    //         std::cout << "Resized projection_graph_ to: " << projection_graph_.size() << std::endl;
+        
+    // }
     omp_set_num_threads(parameters.Get<uint32_t>("num_threads"));
     std::vector<uint32_t> vis_order;
     std::vector<uint32_t> vis_order_sq;
-    for (uint32_t i = 0; i < u32_nd_; ++i) {
+    for (uint32_t i = 0; i < u32_nd_; ++i) { //建立初始索引的基向量数据
         vis_order.push_back(i);
     }
-    for (uint32_t i = 0; i < u32_nd_sq_; ++i) {
+    for (uint32_t i = 0; i < u32_nd_sq_; ++i) { //训练的查询数据
         vis_order_sq.push_back(i);
     }
     std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+    
+   // 首先进行预处理，筛选有效的目标点
+    std::vector<std::pair<uint32_t, uint32_t>> valid_targets; // (sq, valid_index)
+    valid_targets.reserve(u32_nd_sq_);
 
-#pragma omp parallel for schedule(static, 100)
     for (uint32_t it_sq = 0; it_sq < u32_nd_sq_; ++it_sq) {
         uint32_t sq = vis_order_sq[it_sq];
-
         auto &nn_base = learn_base_knn_[sq];
+        
         if (nn_base.size() > Nq) {
             nn_base.resize(Nq);
             nn_base.shrink_to_fit();
         }
-        uint32_t choose_tgt = 0;
-        // for (size_t i = 0; i < 100; ++i) {
-        //     if (projection_graph_[nn_base[i]].size() < M_pjbp) {
-        //         choose_tgt = nn_base[i];
-        //         break;
-        //     }
-        // }
-        uint32_t cur_tgt = nn_base[choose_tgt];
-        std::vector<Neighbor> full_retset;
+
+        // 找到第一个有效的目标点
         for (size_t i = 0; i < nn_base.size(); ++i) {
-            if (nn_base[i] == cur_tgt) {
-                continue;
+            if (nn_base[i] < nd_) {
+                valid_targets.emplace_back(sq, i); //(查询id，有效区域的最近邻)
+                break;
             }
-            float distance = distance_->compare(data_bp_ + dimension_ * (uint64_t)nn_base[i], data_bp_ + dimension_ * (uint64_t)cur_tgt,
-                                                (unsigned)dimension_);
-            full_retset.push_back(Neighbor(nn_base[i], distance, false));
-        }
-        std::vector<uint32_t> pruned_list;
-        pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
-        PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * cur_tgt, cur_tgt, parameters, pruned_list);
-        {
-            LockGuard guard(locks_[cur_tgt]);
-            projection_graph_[cur_tgt] = pruned_list;
-        }
-        ProjectionAddReverse(cur_tgt, parameters);
-        if (sq % 1000 == 0) {
-            std::cout << "\r" << (100.0 * sq) / u32_nd_sq_ << "% of projection search bipartite by base completed."
-                      << std::flush;
         }
     }
 
-    std::cout << std::endl;
+#pragma omp parallel for schedule(static, 100)
+for (size_t valid_idx = 0; valid_idx < valid_targets.size(); ++valid_idx) {
+    uint32_t sq = valid_targets[valid_idx].first;
+    uint32_t choose_tgt = valid_targets[valid_idx].second;
+    
+    auto &nn_base = learn_base_knn_[sq];
+    uint32_t cur_tgt = nn_base[choose_tgt]; //这是第一个与静态一次性建图的区别
+    
+    std::vector<Neighbor> full_retset;
+    full_retset.reserve(nn_base.size());  // 预分配空间
+    
+    bool has_valid_neighbors = false;
+    for (size_t i = 0; i < nn_base.size(); ++i) {
+        if (nn_base[i] == cur_tgt || nn_base[i] >= nd_) {
+            continue;
+        }
+        
+        float distance = distance_->compare(
+            data_bp_ + dimension_ * (uint64_t)nn_base[i], 
+            data_bp_ + dimension_ * (uint64_t)cur_tgt,
+            (unsigned)dimension_
+        );
+        full_retset.push_back(Neighbor(nn_base[i], distance, false));
+        has_valid_neighbors = true;
+    }
+    
+    // 只有在有有效邻居时才进行后续处理
+    if (!has_valid_neighbors || full_retset.empty()) {
+        if (sq % 1000 == 0) {
+            std::cout << "\rSkipping sq " << sq << " due to no valid neighbors." << std::flush;
+        }
+        continue;  // 跳过没有有效邻居的情况
+    }
+
+    std::vector<uint32_t> pruned_list;
+    pruned_list.reserve(M_pjbp * PROJECTION_SLACK);
+    PruneBiSearchBaseGetBase(full_retset, data_bp_ + dimension_ * cur_tgt, cur_tgt, parameters, pruned_list);
+    
+    {
+        LockGuard guard(locks_[cur_tgt]);
+        projection_graph_[cur_tgt] = pruned_list;
+    }
+    ProjectionAddReverse(cur_tgt, parameters);
+    if (sq % 1000 == 0) {
+        std::cout << "\r" << (100.0 * sq) / u32_nd_sq_ 
+                << "% of projection search bipartite by base completed." << std::flush;
+    }
+}
+
+
 #pragma omp parallel for schedule(static, 100)
     for (uint32_t i = 0; i < vis_order.size(); ++i) {
         uint32_t node = vis_order[i];
@@ -1191,11 +2397,11 @@ void IndexBipartite::LinkProjection(const Parameters &parameters) {
 
 #pragma omp parallel for schedule(dynamic, 2048)
     for (uint32_t i = 0; i < nd_; ++i) {
-        size_t node = vis_order[i];
+        size_t node = vis_order[i]; //每个基向量节点
         boost::dynamic_bitset<> visited{u32_nd_, false};
         std::vector<Neighbor> full_retset;
         full_retset.reserve(L_pjpq);
-        NeighborPriorityQueue search_pool;
+        NeighborPriorityQueue search_pool; //_size(0), _capacity(0), _cur(0) {}
         SearchProjectionGraphInternal(search_pool, data_bp_ + dimension_ * node, node, parameters, visited,
                                       full_retset);
         std::vector<uint32_t> pruned_list;
@@ -1256,9 +2462,17 @@ void IndexBipartite::LinkProjection(const Parameters &parameters) {
             if (ok_insert.size() >= M_pjbp * 2) {
                 break;
             }
+            // 首先检查边的id是否在有效范围内
+            uint32_t nbr_id = supply_nbrs_[i][j];
+            
+            if(nbr_id > nd_){
+                std::cout<<"节点"<< i <<"的邻居"<< nbr_id << "超出了范围(nd_=)"<< nd_ <<std::endl;
+                continue;
+            }
+
             if (std::find(projection_graph_[i].begin(), projection_graph_[i].end(), supply_nbrs_[i][j]) ==
                 projection_graph_[i].end()) {
-                ok_insert.push_back(supply_nbrs_[i][j]);
+                    ok_insert.push_back(supply_nbrs_[i][j]);
             }
         }
         projection_graph_[i].insert(projection_graph_[i].end(), ok_insert.begin(), ok_insert.end());
@@ -1267,13 +2481,15 @@ void IndexBipartite::LinkProjection(const Parameters &parameters) {
         // std::copy(ok_insert.begin(), ok_insert.end(), projection_graph_[i].begin() + projection_graph_[i].size());
         // std::copy(ok_insert.begin(), ok_insert.end(), projection_graph_[i].begin());
     }
-
+    
+    
     t2 = std::chrono::high_resolution_clock::now();
 
     // save t2 - t1 in seconds in connectivity enhancement time
     auto connectivity_enhancement_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
 
     std::cout << "Connectivity enhancement time: " << connectivity_enhancement_time << std::endl;
+
 }
 
 void IndexBipartite::SearchProjectionGraphInternal(NeighborPriorityQueue &search_queue, const float *query,
@@ -1313,8 +2529,11 @@ void IndexBipartite::SearchProjectionGraphInternal(NeighborPriorityQueue &search
     // uint32_t cmps = 0;
     while (search_queue.has_unexpanded_node()) {
         // memory_access_metric.reset();
-        auto cur_check_node = search_queue.closest_unexpanded();
+        auto cur_check_node = search_queue.closest_unexpanded(); //首先是ep
         auto cur_id = cur_check_node.id;
+        if(cur_id >= nd_){ // build roar
+            continue;
+        }
         full_retset.push_back(cur_check_node);
         // visited.set(cur_id);
 
@@ -1325,7 +2544,7 @@ void IndexBipartite::SearchProjectionGraphInternal(NeighborPriorityQueue &search
         for (auto nbr : supply_nbrs_[cur_id]) {  // current check node's neighbors
 
             // memory_access_metric.reset();
-            if (visited.test(nbr) || nbr == tgt) {
+            if (nbr >= nd_ || visited.test(nbr) || nbr == tgt) {  //build roar
                 // if (visited.test(nbr)) {
                 continue;
             }
@@ -1617,8 +2836,8 @@ void IndexBipartite::PruneBiSearchBaseGetBase(std::vector<Neighbor> &search_pool
     std::vector<Neighbor> base_pool;
     std::vector<uint32_t> base_id;
 
-
-    for (auto &b_node : search_pool) {
+ //遍历search_pool中的每个节点，去除目标点自身
+    for (auto &b_node : search_pool) { //当前枢轴对于查询的节点
         if (std::find(base_id.begin(), base_id.end(), b_node.id) == base_id.end()) {
             if (b_node.id == tgt_base) {
                 continue;
@@ -1628,23 +2847,24 @@ void IndexBipartite::PruneBiSearchBaseGetBase(std::vector<Neighbor> &search_pool
         }
     }
 
-    std::sort(base_pool.begin(), base_pool.end());
+    std::sort(base_pool.begin(), base_pool.end()); // 对base_pool按距离进行排序
     std::vector<uint32_t> result;
     result.reserve(M_pjbp * PROJECTION_SLACK);
     uint32_t start = 0;
-    result.push_back(base_pool[start].id);
+    result.push_back(base_pool[start].id); // 将第一个节点的ID(距离query的top 1最近邻)加入结果集
 
-    while (result.size() < M_pjbp && (++start) < base_pool.size()) {
-        Neighbor &p = base_pool[start];
+//当结果集大小小于M_pjbp且还有未处理的节点时继续
+    while (result.size() < M_pjbp && (++start) < base_pool.size()) {//result对应论文X
+        Neighbor &p = base_pool[start]; //对应论文Y
         bool occlude = false;
-        for (size_t t = 0; t < result.size(); ++t) {
+        for (size_t t = 0; t < result.size(); ++t) { //
             if (p.id == result[t]) {
                 occlude = true;
                 break;
             }
             float djk = distance_->compare(data_bp_ + dimension_ * p.id, data_bp_ + dimension_ * result[t], dimension_);
-            if (djk < p.distance) {
-                occlude = true;
+            if (djk < p.distance) { //候选节点与结果集的节点间的相似度小于候选节点与枢轴的相似度，
+                occlude = true; //保证邻居范围更广  NNdescent
                 break;
             }
         }
@@ -1855,7 +3075,7 @@ void IndexBipartite::PruneProjectionBaseSearchCandidates(std::vector<Neighbor> &
     result.reserve(M_pjbp * PROJECTION_SLACK);
     uint32_t start = 0;
 
-    if (search_pool[start].id == qid) {
+    if (search_pool[start].id == qid) {           
         start++;
     }
     auto &src_nbrs = projection_graph_[qid];
@@ -1868,9 +3088,12 @@ void IndexBipartite::PruneProjectionBaseSearchCandidates(std::vector<Neighbor> &
         Neighbor &p = search_pool[start];
         bool occlude = false;
         for (size_t t = 0; t < result.size(); ++t) {
-            if (p.id == result[t]) {
+            if (p.id == result[t] ) {
                 occlude = true;
                 break;
+            }
+            if( p.id >= nd_) { //build roar
+                continue;
             }
             float djk = distance_->compare(data_bp_ + dimension_ * p.id, data_bp_ + dimension_ * result[t], dimension_);
             // if (metric_ == efanna2e::Metric::INNER_PRODUCT) {
@@ -1886,7 +3109,7 @@ void IndexBipartite::PruneProjectionBaseSearchCandidates(std::vector<Neighbor> &
             }
         }
         if (!occlude) {
-            if (p.id != qid) {
+            if (p.id != qid && p.id <= nd_) {  //build roar
                 // if (std::find(src_nbrs.begin(), src_nbrs.end(), p.id) == src_nbrs.end()) {
                 result.push_back(p.id);
                 // }
@@ -1901,6 +3124,9 @@ void IndexBipartite::PruneProjectionBaseSearchCandidates(std::vector<Neighbor> &
             if (p.id == result[t]) {
                 occlude = true;
                 break;
+            }
+            if( p.id >= nd_) { //build roar
+                continue;
             }
             float djk = distance_->compare(data_bp_ + dimension_ * p.id, data_bp_ + dimension_ * result[t], dimension_);
             // if (metric_ == efanna2e::Metric::INNER_PRODUCT) {
@@ -1918,7 +3144,7 @@ void IndexBipartite::PruneProjectionBaseSearchCandidates(std::vector<Neighbor> &
         if (!occlude) {
             if (p.id != qid) {
                 // if (std::find(src_nbrs.begin(), src_nbrs.end(), p.id) == src_nbrs.end()) {
-                if (std::find(result.begin(), result.end(), p.id) == result.end()) {
+                if (std::find(result.begin(), result.end(), p.id) == result.end() && p.id <= nd_) {
                     result.push_back(p.id);
                 }
                 // result.push_back(p.id);
@@ -2007,6 +3233,9 @@ void IndexBipartite::CalculateProjectionep() {
     // calculate centroid in base point
     for (size_t i = 0; i < nd_; ++i) {
         for (size_t d = 0; d < dimension_; ++d) {
+            if(data_bp_ == nullptr){
+                std::cout << "Base data is not loaded" << std::endl;
+            }
             center[d] += data_bp_[i * dimension_ + d];
         }
     }
@@ -2040,6 +3269,48 @@ void IndexBipartite::CalculateProjectionep() {
     delete[] distances;
 }
 
+void IndexBipartite::InsertCalculateProjectionep(size_t new_size) {
+    float *center = new float[dimension_]();
+    memset(center, 0, sizeof(float) * dimension_);
+    // calculate centroid in base point
+    for (size_t i = 0; i < new_size; ++i) {
+        for (size_t d = 0; d < dimension_; ++d) {
+            if(data_bp_ == nullptr){
+                std::cout << "Base data is not loaded" << std::endl;
+            }
+            center[d] += data_bp_[i * dimension_ + d];
+        }
+    }
+
+    for (size_t d = 0; d < dimension_; ++d) {
+        center[d] /= (float)new_size;
+    }
+
+    float *distances = new float[new_size]();
+    memset(distances, 0, sizeof(float) * new_size);
+#pragma omp parallel for
+    for (size_t i = 0; i < new_size; ++i) {
+        const float *cur_data = data_bp_ + i * dimension_;
+        float diff = 0;
+        for (size_t j = 0; j < dimension_; ++j) {
+            diff += ((center[j] - cur_data[j]) * (center[j] - cur_data[j]));
+        }
+        distances[i] = diff;
+    }
+
+    uint32_t closest = 0;
+    for (size_t i = 1; i < new_size; ++i) {
+        if (distances[i] < distances[closest]) {
+            closest = static_cast<uint32_t>(i);
+        }
+    }
+    projection_ep_ = closest;
+    // projection_ep_ = min_idx;
+    std::cout << "Inserted projection ep: " << projection_ep_ << std::endl;
+    delete[] center;
+    delete[] distances;
+}
+
 void IndexBipartite::Build(size_t n, const float *data, const Parameters &parameters){};
 
 void IndexBipartite::Save(const char *filename) {
@@ -2053,6 +3324,34 @@ void IndexBipartite::Save(const char *filename) {
         out.write((char *)bipartite_graph_[i].data(), nbr_size * sizeof(uint32_t));
     }
     out.close();
+}
+
+void IndexBipartite::SaveBaseLearn(const char *filename) {
+    // write BaseLearnKNN
+    std::ofstream out(filename, std::ios::binary | std::ios::out);
+    uint32_t npts = static_cast<uint32_t>(u32_nd_);
+    out.write((char *)&npts, sizeof(npts));
+    for (uint32_t i = 0; i < u32_nd_; i++) {
+        uint32_t nbr_size = static_cast<uint32_t>(base_learn_knn_[i].size());
+        out.write((char *)&nbr_size, sizeof(nbr_size));
+        out.write((char *)base_learn_knn_[i].data(), nbr_size * sizeof(uint32_t));
+    }
+    out.close();
+}
+
+void IndexBipartite::LoadBaseLearn(const char *filename) {
+    // load BaseLearnKNN
+    std::ifstream in(filename, std::ios::binary);
+    uint32_t npts;
+    in.read((char *)&npts, sizeof(npts));   
+    base_learn_knn_.resize(npts);
+    for (uint32_t i = 0; i < npts; i++) {
+        uint32_t nbr_size;
+        in.read((char *)&nbr_size, sizeof(nbr_size));
+        base_learn_knn_[i].resize(nbr_size);
+        in.read((char *)base_learn_knn_[i].data(), nbr_size * sizeof(uint32_t));
+    }
+    in.close(); 
 }
 
 void IndexBipartite::Load(const char *filename) {
@@ -2113,6 +3412,9 @@ void IndexBipartite::LoadProjectionGraph(const char *filename) {
     }
     std::cout << "Projection graph, "
               << "avg_degree: " << out_degree / npts << std::endl;
+    std::cout << "projection_graph_ size: "<<projection_graph_.size()<<std::endl; 
+    
+    
     in.close();
 }
 
@@ -2308,6 +3610,7 @@ void IndexBipartite::Search(const float *query, const float *x, size_t k, const 
     }
 }
 
+
 std::pair<uint32_t, uint32_t> IndexBipartite::SearchRoarGraph(const float *query, size_t k, size_t &qid, const Parameters &parameters,
                                                unsigned *indices, std::vector<float>& res_dists) {
     uint32_t L_pq = parameters.Get<uint32_t>("L_pq");
@@ -2415,6 +3718,118 @@ std::pair<uint32_t, uint32_t> IndexBipartite::SearchRoarGraph(const float *query
         // indices[qid * k + i] = search_queue[i].id;
         indices[i] = search_queue[i].id;
         res_dists[i] = search_queue[i].distance;
+    }
+    return std::make_pair(cmps, hops);
+}
+
+
+std::pair<uint32_t, uint32_t> IndexBipartite::SearchRoarGraphPy(const float *query, size_t k, size_t &qid, 
+    uint32_t L_pq,unsigned *indices, float* res_dists) {
+    // uint32_t L_pq = parameters.Get<uint32_t>("L_pq");
+    NeighborPriorityQueue search_queue(L_pq);
+    // search_queue.reserve(L_pq);
+    // std::random_device rd;
+    // std::mt19937 gen(rd());
+    // std::uniform_int_distribution<uint32_t> dis(0, u32_nd_ - 1);
+    // uint32_t start = dis(gen);  // start is base
+    // uint32_t start = projection_ep_;
+    // projection_ep_ = start;
+    std::vector<uint32_t> init_ids;
+    init_ids.push_back(projection_ep_);
+    prefetch_vector((char *)(data_bp_ + projection_ep_ * dimension_), dimension_);
+    // init_ids.push_back(projection_ep_);
+    // _mm_prefetch((char *)data_bp_ + projection_ep_ * dimension_, _MM_HINT_T0);
+    // init_ids.push_back(dis(gen));
+    // block_metric.reset();
+    // boost::dynamic_bitset<> visited{u32_nd_, 0};
+    // tsl::robin_set<uint32_t> visited(5000);
+    // std::bitset<bsize> visited;
+    // block_metric.record();
+    VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+    vl_type *visited_array = vl->mass;
+    vl_type visited_array_tag = vl->curV;
+
+    for (auto &id : init_ids) {
+
+    // dist_cmp_metric.reset();
+    float distance = distance_->compare(data_bp_ + id * dimension_, query, (unsigned)dimension_);
+    // if (metric_ == efanna2e::Metric::INNER_PRODUCT) {
+    //     distance = -distance;
+    // }
+    // dist_cmp_metric.record();
+
+    // memory_access_metric.reset();
+    Neighbor nn = Neighbor(id, distance, false);
+    search_queue.insert(nn);
+    // visited_array[id] = visited_array_tag;
+    // visited.set(id);
+    // visited.insert(id);
+    // memory_access_metric.record();
+    }
+    uint32_t cmps = 0;
+    uint32_t hops = 0;
+    while (search_queue.has_unexpanded_node()) {
+    // memory_access_metric.reset();
+    auto cur_check_node = search_queue.closest_unexpanded();
+    auto cur_id = cur_check_node.id;
+    // visited.set(cur_id);
+    uint32_t *cur_nbrs = projection_graph_[cur_id].data();
+    // memory_access_metric.record();
+    // _mm_prefetch((char *)(visited_array + *(cur_nbrs + 1)), _MM_HINT_T0);
+    // _mm_prefetch((char *)(data_bp_ + *(cur_nbrs) * dimension_), _MM_HINT_T0);
+
+    ++hops;
+    // get neighbors' neighbors, first
+    for (size_t j = 0; j < projection_graph_[cur_id].size(); ++j) {  // current check node's neighbors
+    uint32_t nbr = *(cur_nbrs + j);
+    // memory_access_metric.reset();
+    // if (visited.find(nbr) != visited.end()) {
+    // _mm_prefetch((char *)(visited_array + *(cur_nbrs + j)), _MM_HINT_T0);
+    // if (j + 1 <= projection_graph_[cur_id].size()) {
+    _mm_prefetch((char *)(visited_array + *(cur_nbrs + j + 1)), _MM_HINT_T0);
+    _mm_prefetch((char *)(data_bp_ + *(cur_nbrs + j + 1) * dimension_), _MM_HINT_T0);
+    // }
+    // _mm_prefetch((char *)(data_bp_ + *(cur_nbrs + j) * dimension_), _MM_HINT_T0);
+    if (visited_array[nbr] != visited_array_tag) {
+    // if (visited.test(nbr)) {
+    //     continue;
+    // }
+    // prefetch_vector((char *)(data_bp_ + nbr * dimension_), dimension_);
+    // visited.insert(nbr);
+    // visited.set(nbr);
+    visited_array[nbr] = visited_array_tag;
+    // memory_access_metric.record();
+    float distance = distance_->compare(data_bp_ + nbr * dimension_, query, (unsigned)dimension_);
+    // _mm_prefetch((char *) data_bp_ + )
+    // dist_cmp_metric.reset();
+    // if (likely(metric_ == efanna2e::INNER_PRODUCT)) {
+    //     distance = -distance;
+    // }
+
+    // dist_cmp_metric.record();
+    // memory_access_metric.reset();
+
+    ++cmps;
+    search_queue.insert({nbr, distance, false});
+    // if(search_queue.insert({nbr, distance, false})) {
+    //     _mm_prefetch((char *)projection_graph_[nbr].data(), _MM_HINT_T2);
+    // }
+    // memory_access_metric.record();
+    }
+    }
+    }
+    visited_list_pool_->releaseVisitedList(vl);
+
+    if (unlikely(search_queue.size() < k)) {
+    std::stringstream ss;
+    ss << "not enough results: " << search_queue.size() << ", expected: " << k;
+    throw std::runtime_error(ss.str());
+    }
+
+    for (size_t i = 0; i < k; ++i) {
+    // indices[qid * k + i] = search_queue[i].id;
+    indices[i] = search_queue[i].id;
+    res_dists[i] = search_queue[i].distance;
     }
     return std::make_pair(cmps, hops);
 }
@@ -2618,6 +4033,22 @@ void IndexBipartite::SaveProjectionGraph(const char *filename) {
     out.close();
 }
 
+void IndexBipartite::SaveInsertProjectionGraph(const char *filename, size_t num_vectors) {
+    std::ofstream out(filename, std::ios::binary | std::ios::out);
+    if (!out.is_open()) {
+        throw std::runtime_error("cannot open file");
+    }
+    out.write((char *)&projection_ep_, sizeof(uint32_t));
+    out.write((char *)&num_vectors, sizeof(uint32_t));  
+    for (uint32_t i = 0; i < num_vectors; ++i) {
+        uint32_t nbr_size = projection_graph_[i].size();
+        out.write((char *)&nbr_size, sizeof(uint32_t));
+        out.write((char *)projection_graph_[i].data(), sizeof(uint32_t) * nbr_size);
+    }
+    out.close();
+    std::cout<<"Saved projection graph size: "<< projection_graph_.size() <<std::endl;
+}
+
 // gt file: base in query
 void IndexBipartite::LoadLearnBaseKNN(const char *filename) {
     std::ifstream in(filename, std::ios::binary);
@@ -2635,6 +4066,7 @@ void IndexBipartite::LoadLearnBaseKNN(const char *filename) {
         learn_base_knn_[i].resize(k_dim);
         in.read((char *)learn_base_knn_[i].data(), sizeof(uint32_t) * k_dim);
     }
+
     if (learn_base_knn_.back().size() != k_dim) {
         throw std::runtime_error("learn base knn file error");
     }
@@ -2674,7 +4106,7 @@ void IndexBipartite::LoadVectorData(const char *base_file, const char *sampled_q
     float *base_data = nullptr;
     float *sampled_query_data = nullptr;
     load_data<float>(base_file, base_num, base_dim, base_data);
-    // load_data<float>(sampled_query_file, sq_num, q_dim, sampled_query_data);
+    load_data<float>(sampled_query_file, sq_num, q_dim, sampled_query_data);
 
     if (need_normalize) {
         std::cout << "Normalizing base data" << std::endl;
@@ -2683,9 +4115,10 @@ void IndexBipartite::LoadVectorData(const char *base_file, const char *sampled_q
         }
     }
 
-    data_bp_ = data_align(base_data, base_num, base_dim);
+    // data_bp_ = data_align(base_data, base_num, base_dim);
     // data_sq_ = data_align(sampled_query_data, sq_num, q_dim);
-
+    data_bp_=base_data;
+    data_sq_=sampled_query_data; 
     nd_ = base_num;
     nd_sq_ = sq_num;
     total_pts_ = nd_ + nd_sq_;

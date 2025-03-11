@@ -26,13 +26,26 @@ class IndexBipartite : public Index {
    public:
     explicit IndexBipartite(const size_t dimension, const size_t n, Metric m, Index *initializer);
     virtual ~IndexBipartite();
+
+    void SaveBaseLearn(const char *filename) ;
+    void LoadBaseLearn(const char *filename) ;
+
     virtual void Save(const char *filename) override;
     virtual void Load(const char *filename) override;
     virtual void Search(const float *query, const float *x, size_t k, const Parameters &parameters,
                         unsigned *indices, float *res_dists) override;
+    void SetBaseData(float* aligned_data) {
+        // if (data_bp_) {
+        //     delete[] data_bp_;  // 如果已存在数据，先释放
+        // }
+        // data_bp_ = aligned_data;
+        // data_sq_ = aligned_data_sq;
+        locks_ = std::vector<std::mutex>(10000000);
+        // u32_nd_sq_ = n_sq;
+    }
     // virtual void BuildBipartite(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
     //                             const Parameters &parameters) override;
-    void BuildBipartite(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
+     void BuildBipartite(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
                                 const Parameters &parameters);
 
     void BuildRoarGraph(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
@@ -71,6 +84,7 @@ class IndexBipartite : public Index {
     void BipartiteProjectionReserveSpace(const Parameters &parameters);
 
     void CalculateProjectionep();
+    void InsertCalculateProjectionep(size_t new_size);
 
     void LinkProjection(const Parameters &parameters);
 
@@ -100,7 +114,11 @@ class IndexBipartite : public Index {
     std::pair<uint32_t, uint32_t> SearchRoarGraph(const float *query, size_t k, size_t &qid, const Parameters &parameters,
                                    unsigned *indices, std::vector<float>& res_dists);
 
+    std::pair<uint32_t, uint32_t> SearchRoarGraphPy(const float *query, size_t k, size_t &qid, 
+                                    uint32_t L_pq,unsigned *indices, float* res_dists);
+                                    
     void SaveProjectionGraph(const char *filename);
+    void SaveInsertProjectionGraph(const char *filename, size_t num_vectors);
 
     void LoadProjectionGraph(const char *filename);
 
@@ -137,6 +155,16 @@ class IndexBipartite : public Index {
     std::pair<uint32_t, uint32_t> SearchBipartiteGraph(const float *query, size_t k, size_t &qid, const Parameters &parameters,
                                               unsigned *indices, std::vector<float>& dists);
 
+    void BuildRoarGraphwithData(size_t n_sq, const float *sq_data, size_t n_bp, const float *bp_data,
+                                                const Parameters &parameters);
+    // 批量插入新向量到RoarGraph
+    void InsertIntoRoarGraph(const float* new_vectors,
+                             const size_t* ids,
+                             size_t num_vectors,
+                             const Parameters& parameters);
+
+    // 增强图的连通性
+    void EnhanceConnectivity(const Parameters& parameters);
     Index *initializer_;
     TimeMetric dist_cmp_metric;
     TimeMetric memory_access_metric;
@@ -147,7 +175,7 @@ class IndexBipartite : public Index {
    protected:
     std::vector<std::vector<uint32_t>> bipartite_graph_;
     std::vector<std::vector<uint32_t>> final_graph_;
-    std::vector<std::vector<uint32_t>> projection_graph_;
+    std::vector<std::vector<uint32_t>> projection_graph_;//(1) 50
     std::vector<std::vector<uint32_t>> supply_nbrs_;
     std::vector<std::vector<uint32_t>> learn_base_knn_;
     std::vector<std::vector<uint32_t>> base_learn_knn_;
@@ -168,5 +196,6 @@ class IndexBipartite : public Index {
     uint32_t u32_nd_sq_;
     uint32_t u32_total_pts_;
     uint32_t projection_ep_;
+    std::mutex update_lock_;
 };
 }  // namespace efanna2e

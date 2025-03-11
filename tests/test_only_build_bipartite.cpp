@@ -23,13 +23,22 @@ int main(int argc, char **argv) {
     std::string base_data_file;
     std::string sampled_query_data_file;
     // std::string query_data_file;
-    std::string bipartite_index_save_file, projection_index_save_file, learn_base_nn_file, base_learn_nn_file;
+    std::string bipartite_index_save_file, projection_index_save_file, learn_base_nn_file, base_learn_nn_save_file;
     std::string data_type;
     std::string dist;
     uint32_t M_bp, M_sq;
     uint32_t M_pjbp, L_pjpq;
     uint32_t L_pq;
     uint32_t num_threads;
+
+/*
+./tests/test_only_build_bipartite --data_type float --dist ip \
+--base_data_path ${prefix}/base.10M.fbin  \
+--sampled_query_data_path ${prefix}/query.train.10M.fbin \
+--base_learn_nn_save_path ${prefix}/base_learn_knn.bin \
+--learn_base_nn_path ${prefix}/train.gt_10M.bin
+*/
+
 
     po::options_description desc{"Arguments"};
     try {
@@ -45,9 +54,13 @@ int main(int argc, char **argv) {
         //                    "Query file in bin format");
         desc.add_options()("bipartite_index_save_path", po::value<std::string>(&bipartite_index_save_file)->required(),
                            "Path prefix for saving bipartite index file components");
-        desc.add_options()("projection_index_save_path",
-                           po::value<std::string>(&projection_index_save_file)->required(),
-                           "Path prefix for saving projetion index file components");
+        // desc.add_options()("projection_index_save_path",
+        //                    po::value<std::string>(&projection_index_save_file)->required(),
+        //                    "Path prefix for saving projetion index file components");
+        // desc.add_options()("base_learn_nn_save_path", 
+        //                   po::value<std::string>(&base_learn_nn_save_file)->required(),
+        //                   "path prefix for saving base-learn NN file components");
+
         desc.add_options()("M_bp", po::value<uint32_t>(&M_bp)->default_value(32),
                            "Number of neighbors for base points to build the bipartite graph");
         desc.add_options()("M_sq", po::value<uint32_t>(&M_sq)->default_value(32),
@@ -63,8 +76,8 @@ int main(int argc, char **argv) {
                            "omp_get_num_procs())");
         desc.add_options()("learn_base_nn_path", po::value<std::string>(&learn_base_nn_file)->required(),
                            "Path of learn-base NN file");
-        desc.add_options()("base_learn_nn_path", po::value<std::string>(&base_learn_nn_file)->required(),
-                           "Path of base-learn NN file");
+        // desc.add_options()("base_learn_nn_path", po::value<std::string>(&base_learn_nn_file)->required(),
+        //                    "Path of base-learn NN file");
 
         po::variables_map vm;
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -112,7 +125,7 @@ int main(int argc, char **argv) {
     //     efanna2e::ip_normalize(aligned_data_bp, base_dim);
     //     dist_metric = efanna2e::L2;
     // }
-    std::cout << "Index save path: " << projection_index_save_file << std::endl;
+    // std::cout << "Index save path: " << projection_index_save_file << s.td::endl;
     efanna2e::IndexBipartite index_bipartite(base_dim, base_num + sq_num, dist_metric, nullptr);
     parameters.Set<uint32_t>("M_bp", M_bp);
     parameters.Set<uint32_t>("M_sq", M_sq);
@@ -131,8 +144,9 @@ int main(int argc, char **argv) {
     auto e = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = e - s;
 
-    std::cout << "indexing time: " << diff.count() << "\n";
+    std::cout << "base_leaen_knn_ time: " << diff.count() << "\n";
     index_bipartite.Save(bipartite_index_save_file.c_str());
+    // index_bipartite.SaveBaseLearn(base_learn_nn_save_file.c_str());
     // index_bipartite.SaveProjectionGraph(projection_index_save_file.c_str());
     std::cout << "Save index to " << bipartite_index_save_file << std::endl;
 
